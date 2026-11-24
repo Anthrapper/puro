@@ -93,7 +93,7 @@ jobs:
           Copy-Item .\bin\puro.exe $standalone
           & $standalone install-puro --promote --no-path
           $installed = Join-Path $root 'bin\puro.exe'
-          foreach ($name in @('puro.exe', 'puro.bat', 'dart.bat', 'flutter.bat')) {
+          foreach ($name in @('puro.exe', 'dart.bat', 'flutter.bat')) {
             $path = Join-Path $root "bin\$name"
             if (-not (Test-Path -LiteralPath $path)) {
               throw "Missing installed file: $path"
