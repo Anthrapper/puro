@@ -1,0 +1,159 @@
+name: windows-arm64
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      flutter_smoke:
+        description: Run Flutter install and updater smoke tests
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.10.0
+          architecture: arm64
+
+      - name: Verify Dart architecture
+        run: |
+          $version = dart --version | Out-String
+          $version
+          if ($version -notmatch 'windows_arm64') {
+            throw "Expected an ARM64 Dart SDK, got: $version"
+          }
+
+      - name: Resolve dependencies
+        working-directory: puro
+        run: dart pub get
+
+      - name: Check formatting
+        working-directory: puro
+        run: dart format --set-exit-if-changed .
+
+      - name: Analyze
+        working-directory: puro
+        run: dart analyze .
+
+      - name: Test
+        working-directory: puro
+        run: dart test -r expanded
+
+      - name: Build Puro
+        working-directory: puro
+        run: ./build.ps1 --release
+
+      - name: Verify executable architecture
+        working-directory: puro
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find '**\dumpbin.exe' |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            throw 'dumpbin was not found'
+          }
+          $headers = & $dumpbin /headers .\bin\puro.exe | Out-String
+          $headers
+          if ($headers -notmatch 'AA64') {
+            throw 'puro.exe is not an ARM64 PE executable'
+          }
+
+      - name: Verify build target
+        working-directory: puro
+        run: |
+          $version = .\bin\puro.exe version --no-update-check | Out-String
+          $version
+          if ($version -notmatch '/windows-arm64') {
+            throw "Puro did not select the Windows ARM64 target: $version"
+          }
+
+      - name: Install smoke test
+        working-directory: puro
+        run: |
+          $env:PURO_ROOT = Join-Path $env:RUNNER_TEMP 'puro-arm64-smoke'
+          $root = $env:PURO_ROOT
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          $standalone = Join-Path $env:RUNNER_TEMP 'puro-arm64-standalone.exe'
+          Copy-Item .\bin\puro.exe $standalone
+          & $standalone install-puro --promote --no-path
+          $installed = Join-Path $root 'bin\puro.exe'
+          foreach ($name in @('puro.exe', 'puro.bat', 'dart.bat', 'flutter.bat')) {
+            $path = Join-Path $root "bin\$name"
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Missing installed file: $path"
+            }
+          }
+          $version = & $installed version --no-update-check | Out-String
+          $version
+          if ($version -notmatch 'distribution/windows-arm64') {
+            throw "Installed Puro has the wrong target: $version"
+          }
+
+      - name: Upload ARM64 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: puro-windows-arm64
+          path: puro/bin/puro.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Flutter and updater smoke tests
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.flutter_smoke)
+        working-directory: puro
+        run: |
+          $env:PURO_ROOT = Join-Path $env:RUNNER_TEMP 'puro-arm64-smoke'
+          $root = $env:PURO_ROOT
+          $puro = Join-Path $root 'bin\puro.exe'
+
+          & $puro create stable
+          $stableDart = & $puro --env stable dart --version | Out-String
+          $stableDart
+          if ($stableDart -notmatch 'windows_arm64') {
+            throw "Stable Flutter did not use ARM64 Dart: $stableDart"
+          }
+          & $puro --env stable flutter --version
+
+          & $puro create legacy 3.41.9
+          $legacyDart = & $puro --env legacy dart --version | Out-String
+          $legacyDart
+          if ($legacyDart -notmatch 'windows_x64') {
+            throw "Legacy Flutter did not fall back to x64 Dart: $legacyDart"
+          }
+
+          $fixture = Join-Path $env:RUNNER_TEMP 'puro-update-fixture'
+          Remove-Item -Recurse -Force $fixture -ErrorAction SilentlyContinue
+          $fixtureTarget = Join-Path $fixture 'master\windows-arm64'
+          New-Item -ItemType Directory -Path $fixtureTarget -Force | Out-Null
+          Copy-Item .\bin\puro.exe (Join-Path $fixtureTarget 'puro.exe')
+          $port = 18765
+          $server = Start-Process -FilePath 'python' -ArgumentList @(
+            '-m', 'http.server', $port, '--bind', '127.0.0.1', '--directory', $fixture
+          ) -PassThru
+          try {
+            Start-Sleep -Seconds 1
+            & $puro _prefs puroBuildsUrl "http://127.0.0.1:$port"
+            & $puro upgrade-puro master --force --no-path
+            $updated = & $puro version --no-update-check | Out-String
+            $updated
+            if ($updated -notmatch 'distribution/windows-arm64') {
+              throw "Updater changed the Puro target: $updated"
+            }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }

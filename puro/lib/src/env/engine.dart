@@ -1,3 +1,4 @@
+import 'dart:ffi';
 import 'dart:io';
 
 import 'package:file/file.dart';
@@ -26,6 +27,11 @@ enum EngineArch { x64, arm64 }
 
 enum EngineBuildTarget {
   windowsX64('dart-sdk-windows-x64.zip', EngineOS.windows, EngineArch.x64),
+  windowsArm64(
+    'dart-sdk-windows-arm64.zip',
+    EngineOS.windows,
+    EngineArch.arm64,
+  ),
   linuxX64('dart-sdk-linux-x64.zip', EngineOS.linux, EngineArch.x64),
   linuxArm64('dart-sdk-linux-arm64.zip', EngineOS.linux, EngineArch.arm64),
   macosX64('dart-sdk-darwin-x64.zip', EngineOS.macOS, EngineArch.x64),
@@ -37,40 +43,35 @@ enum EngineBuildTarget {
   final EngineOS os;
   final EngineArch arch;
 
-  static EngineBuildTarget from(EngineOS os, EngineArch arch) {
-    switch (os) {
-      case EngineOS.windows:
-        switch (arch) {
-          case EngineArch.x64:
-            return EngineBuildTarget.windowsX64;
-          case EngineArch.arm64:
-            break;
-        }
-        break;
-      case EngineOS.macOS:
-        switch (arch) {
-          case EngineArch.x64:
-            return EngineBuildTarget.macosX64;
-          case EngineArch.arm64:
-            return EngineBuildTarget.macosArm64;
-        }
-      case EngineOS.linux:
-        switch (arch) {
-          case EngineArch.x64:
-            return EngineBuildTarget.linuxX64;
-          case EngineArch.arm64:
-            return EngineBuildTarget.linuxArm64;
-        }
-    }
-    throw AssertionError('Unsupported build target: $os $arch');
-  }
+  EngineBuildTarget? get fallback => switch (this) {
+    EngineBuildTarget.macosArm64 => EngineBuildTarget.macosX64,
+    EngineBuildTarget.windowsArm64 => EngineBuildTarget.windowsX64,
+    _ => null,
+  };
+
+  static EngineBuildTarget from(EngineOS os, EngineArch arch) => switch (os) {
+    EngineOS.windows => switch (arch) {
+      EngineArch.x64 => EngineBuildTarget.windowsX64,
+      EngineArch.arm64 => EngineBuildTarget.windowsArm64,
+    },
+    EngineOS.macOS => switch (arch) {
+      EngineArch.x64 => EngineBuildTarget.macosX64,
+      EngineArch.arm64 => EngineBuildTarget.macosArm64,
+    },
+    EngineOS.linux => switch (arch) {
+      EngineArch.x64 => EngineBuildTarget.linuxX64,
+      EngineArch.arm64 => EngineBuildTarget.linuxArm64,
+    },
+  };
 
   static Future<EngineBuildTarget> query({required Scope scope}) async {
     final EngineOS os;
     final EngineArch arch;
     if (Platform.isWindows) {
       os = EngineOS.windows;
-      arch = EngineArch.x64;
+      arch = Abi.current() == Abi.windowsArm64
+          ? EngineArch.arm64
+          : EngineArch.x64;
     } else if (Platform.isMacOS) {
       os = EngineOS.macOS;
       final sysctlResult = await runProcess(scope, 'sysctl', [
@@ -111,6 +112,32 @@ enum EngineBuildTarget {
   static final Provider<Future<EngineBuildTarget>> provider = Provider(
     (scope) => query(scope: scope),
   );
+}
+
+const _windowsArm64FallbackMarker = '.puro-windows-arm64-fallback';
+
+bool _matchesDartSdkArchitecture(String output, EngineBuildTarget target) {
+  if (target.os != EngineOS.windows) {
+    return true;
+  }
+  final architecture = target.arch == EngineArch.arm64
+      ? 'windows_arm64'
+      : 'windows_x64';
+  return output.contains(architecture);
+}
+
+bool dartSdkMatchesEngineBuildTarget(
+  String output,
+  EngineBuildTarget target, {
+  bool allowFallback = false,
+}) {
+  if (_matchesDartSdkArchitecture(output, target)) {
+    return true;
+  }
+  final fallback = target.fallback;
+  return allowFallback &&
+      fallback != null &&
+      _matchesDartSdkArchitecture(output, fallback);
 }
 
 /// Unzips [zipFile] into [destination].
@@ -168,21 +195,31 @@ Future<bool> downloadSharedEngine({
 }) async {
   final config = PuroConfig.of(scope);
   final log = PuroLogger.of(scope);
+  final target = await scope.read(EngineBuildTarget.provider);
   final sharedCache = config.getFlutterCache(engineCommit, patched: false);
+  final fallbackMarker = sharedCache.cacheDir.childFile(
+    _windowsArm64FallbackMarker,
+  );
   var didDownloadEngine = false;
 
-  // Delete the current cache if it's corrupt
   if (sharedCache.exists) {
     try {
       await ProgressNode.of(scope).wrap((scope, node) async {
         node.description = 'Checking if dart works';
-        await runProcess(
+        final result = await runProcess(
           scope,
           sharedCache.dartSdk.dartExecutable.path,
           ['--version'],
           throwOnFailure: true,
           environment: {'PUB_CACHE': config.legacyPubCacheDir.path},
         );
+        if (!dartSdkMatchesEngineBuildTarget(
+          result.stdout as String,
+          target,
+          allowFallback: fallbackMarker.existsSync(),
+        )) {
+          throw StateError('Cached Dart SDK does not match ${target.zipName}');
+        }
       });
     } catch (exception) {
       log.w('dart version check failed, deleting cache');
@@ -193,12 +230,14 @@ Future<bool> downloadSharedEngine({
   if (!sharedCache.exists) {
     log.v('Downloading engine');
 
-    final target = await scope.read(EngineBuildTarget.provider);
     final engineZipUrl = config.flutterStorageBaseUrl.append(
       path: 'flutter_infra_release/flutter/$engineCommit/${target.zipName}',
     );
     sharedCache.cacheDir.createSync(recursive: true);
-    final zipFile = config.sharedCachesDir.childFile('$engineCommit.zip');
+    final zipFile = config.sharedCachesDir.childFile(
+      '$engineCommit-${target.zipName}.zip',
+    );
+    var usedFallback = false;
     try {
       await downloadFile(
         scope: scope,
@@ -207,18 +246,16 @@ Future<bool> downloadSharedEngine({
         description: 'Downloading engine',
       );
     } on HttpException catch (e) {
-      // Flutter versions older than 3.0.0 don't have builds for M1 chips but
-      // the intel ones will run fine, in the future we could check the contents
-      // of shared.sh or the git tree, but this is much simpler.
-      if (e.statusCode == 404 && target == EngineBuildTarget.macosArm64) {
-        final engineZipUrl = config.flutterStorageBaseUrl.append(
+      final fallback = target.fallback;
+      if (e.statusCode == 404 && fallback != null) {
+        usedFallback = true;
+        final fallbackUrl = config.flutterStorageBaseUrl.append(
           path:
-              'flutter_infra_release/flutter/$engineCommit/'
-              '${EngineBuildTarget.macosX64.zipName}',
+              'flutter_infra_release/flutter/$engineCommit/${fallback.zipName}',
         );
         await downloadFile(
           scope: scope,
-          url: engineZipUrl,
+          url: fallbackUrl,
           file: zipFile,
           description: 'Downloading engine',
         );
@@ -237,6 +274,11 @@ Future<bool> downloadSharedEngine({
       );
     });
 
+    if (usedFallback && target == EngineBuildTarget.windowsArm64) {
+      fallbackMarker.writeAsStringSync(engineCommit);
+    } else if (fallbackMarker.existsSync()) {
+      fallbackMarker.deleteSync();
+    }
     zipFile.deleteSync();
 
     didDownloadEngine = true;

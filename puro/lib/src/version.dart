@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -103,7 +104,7 @@ class PuroVersion {
   static final provider = Provider((scope) async {
     final log = PuroLogger.of(scope);
     final config = PuroConfig.of(scope);
-    final target = PuroBuildTarget.query();
+    final target = config.buildTarget;
 
     log.d('target: $target');
     log.d('Platform.executable: ${Platform.executable}');
@@ -245,6 +246,7 @@ class PuroVersion {
 
 enum PuroBuildTarget {
   windowsX64('windows-x64', '.exe', '.bat'),
+  windowsArm64('windows-arm64', '.exe', '.bat'),
   linuxX64('linux-x64', '', ''),
   macosX64('darwin-x64', '', ''),
   macosArm64('darwin-arm64', '', '');
@@ -255,6 +257,8 @@ enum PuroBuildTarget {
     switch (str) {
       case 'windows-x64':
         return PuroBuildTarget.windowsX64;
+      case 'windows-arm64':
+        return PuroBuildTarget.windowsArm64;
       case 'linux-x64':
         return PuroBuildTarget.linuxX64;
       case 'darwin-x64':
@@ -277,7 +281,9 @@ enum PuroBuildTarget {
 
   static PuroBuildTarget query() {
     if (Platform.isWindows) {
-      return PuroBuildTarget.windowsX64;
+      return Abi.current() == Abi.windowsArm64
+          ? PuroBuildTarget.windowsArm64
+          : PuroBuildTarget.windowsX64;
     } else if (Platform.isLinux) {
       return PuroBuildTarget.linuxX64;
     } else if (Platform.isMacOS) {

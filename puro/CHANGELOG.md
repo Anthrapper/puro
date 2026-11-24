@@ -1,3 +1,7 @@
+## 1.6.0
+
+* Added native Windows ARM64 build
+
 ## 1.5.0
 
 * Fixed several major bugs
